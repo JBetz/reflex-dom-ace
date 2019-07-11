@@ -1,20 +1,14 @@
 {-# LANGUAGE ConstraintKinds       #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
-{-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE NoOverloadedStrings   #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE UndecidableInstances  #-}
 
 {-|
 
 Basic support for using the ACE editor with Reflex.
-
-IMPORTANT NOTE:
-
-This currently does not work if your app is using reflex-dom's
-mainWidgetWithHead or mainWidgetWithCss.
 
 Example usage:
 
@@ -41,7 +35,6 @@ import           Data.Default
 import           Data.Map                           (Map)
 import qualified Data.Map                           as M
 import           Data.Maybe                         (fromMaybe)
-import           Data.Monoid
 import           Data.Text                          (Text)
 import qualified Data.Text                          as T
 import           GHCJS.DOM.Types                    (Element, JSVal, toJSString)
@@ -142,6 +135,7 @@ data AceConfig = AceConfig
     , _aceConfigMode            :: Maybe Text
     , _aceConfigWordWrap        :: Bool
     , _aceConfigShowPrintMargin :: Bool
+    , _aceConfigShowLineNumbers :: Bool
     }
 
 
@@ -151,15 +145,16 @@ data AceDynConfig = AceDynConfig
 
 
 instance Default AceConfig where
-    def = AceConfig def def def False False
+    def = AceConfig def def def False False True
 
 
 newtype AceInstance = AceInstance { unAceInstance :: JSVal }
 
 
 data ACE t = ACE
-    { aceRef   :: Dynamic t (Maybe AceInstance)
-    , aceValue :: Dynamic t Text
+    { aceRef      :: Dynamic t (Maybe AceInstance)
+    , aceValue    :: Dynamic t Text
+    , aceHasFocus :: Dynamic t Bool
     }
 
 
@@ -224,6 +219,9 @@ startACE elmt ac = liftJSM $ do
   let aceInst  = AceInstance editSession
   setUseWrapMode (_aceConfigWordWrap ac) aceInst
   setShowPrintMargin (_aceConfigShowPrintMargin ac) aceInst
+  setShowLineNumbers (_aceConfigShowLineNumbers ac) aceInst
+  setShowGutter True aceInst
+  setAutoScrollEditorIntoView False aceInst
   return aceInst
 
 
@@ -262,6 +260,21 @@ setShowPrintMargin shouldShow (AceInstance ace) =
 
 
 ------------------------------------------------------------------------------
+setShowLineNumbers :: MonadJSM m => Bool -> AceInstance -> m ()
+setShowLineNumbers shouldShow (AceInstance ace) =
+  liftJSM $ void $ ace ^. js2 "setOption" "showLineNumbers" shouldShow
+
+------------------------------------------------------------------------------
+setShowGutter :: MonadJSM m => Bool -> AceInstance -> m ()
+setShowGutter shouldShow (AceInstance ace) =
+  liftJSM $ void $ ace ^. js2 "setOption" "showGutter" shouldShow
+
+------------------------------------------------------------------------------
+setAutoScrollEditorIntoView :: MonadJSM m => Bool -> AceInstance -> m ()
+setAutoScrollEditorIntoView shouldAutoScroll (AceInstance ace) =
+  liftJSM $ void $ ace ^. js2 "setOption" "autoScrollEditorIntoView" shouldAutoScroll
+
+------------------------------------------------------------------------------
 setUseWorker :: MonadJSM m => Bool -> AceInstance -> m ()
 setUseWorker shouldUse (AceInstance ace) =
   liftJSM $ void $ ace ^. js2 "setOption" "useWorker" shouldUse
@@ -295,6 +308,11 @@ setValueACE t (AceInstance ace) =
 
 
 ------------------------------------------------------------------------------
+getFocusedACE :: MonadJSM m => AceInstance -> m Bool
+getFocusedACE (AceInstance ace) =
+  liftJSM $ ace ^. js0 "isFocused" >>= fromJSValUnchecked
+
+------------------------------------------------------------------------------
 setupValueListener
   :: ( MonadJSM (Performable m)
      , DomBuilder t m
@@ -312,14 +330,31 @@ setupValueListener (AceInstance ace) = do
         void $ ace ^. js2 "on" "change" jscb
   performEventAsync (act <$ pb)
 
+setupFocusListener
+  :: ( MonadJSM (Performable m)
+     , DomBuilder t m
+     , PostBuild t m
+     , TriggerEvent t m
+     , PerformEvent t m
+     )
+  => AceInstance
+  -> m (Event t Bool)
+setupFocusListener (AceInstance ace) = do
+  pb  <- getPostBuild
+  let actBlur cb = liftJSM $ do
+        jscb <- asyncFunction $ \_ _ _ ->
+          getFocusedACE (AceInstance ace) >>= liftIO . cb
+        void $ ace ^. js2 "on" "blur" jscb
+      actFocus cb = liftJSM $ do
+        jscb <- asyncFunction $ \_ _ _ ->
+          getFocusedACE (AceInstance ace) >>= liftIO . cb
+        void $ ace ^. js2 "on" "focus" jscb
+  evtBlur <- performEventAsync (actBlur <$ pb)
+  evtFocus <- performEventAsync (actFocus <$ pb)
+  pure $ leftmost [evtFocus, evtBlur]
 
 ------------------------------------------------------------------------------
 -- | Main entry point
---
--- IMPORTANT NOTE:
---
--- This currently does not work if your app is using reflex-dom's
--- mainWidgetWithHead or mainWidgetWithCss.
 aceWidget
     :: MonadWidget t m
     => AceConfig -> AceDynConfig -> Event t AceDynConfig -> Text -> m (ACE t)
@@ -328,11 +363,43 @@ aceWidget ac adc adcUps initContents = do
     aceDiv <- fmap fst $ elDynAttr' (T.pack "div") attrs $ text initContents
     aceInstance <- startACE (_element_raw aceDiv) ac
     onChange <- setupValueListener aceInstance
+    hasFocus <- setupFocusListener aceInstance
     updatesDyn <- holdDyn initContents onChange
+    focusDyn <- holdDyn False hasFocus
 
-    let ace = ACE (constDyn $ pure aceInstance) updatesDyn
+    let ace = ACE (constDyn $ pure aceInstance) updatesDyn focusDyn
     setThemeACE (_aceDynConfigTheme adc) aceInstance
-    withAceInstance ace (setThemeACE . _aceDynConfigTheme <$> adcUps)
+    _ <- withAceInstance ace (setThemeACE . _aceDynConfigTheme <$> adcUps)
+    return ace
+  where
+    static = _aceConfigElemAttrs ac
+    themeAttr t = T.pack $ " ace-" <> show t
+    addThemeAttr c = maybe static
+      (\t -> M.insertWith (<>) (T.pack "class") (themeAttr t) static)
+      (_aceDynConfigTheme c)
+
+
+------------------------------------------------------------------------------
+-- | This function is the same a aceWidget except it uses elAttr' instead of
+-- elDynAttr' which for some unexplained reason solves editor rendering
+-- problems in some situations.
+--
+-- We're adding this as a separate function to avoid potentially breaking
+-- users that may have been depending on the old behavior.  This function may
+-- replace aceWidget in the future and go away.
+aceWidgetStatic
+    :: MonadWidget t m
+    => AceConfig -> AceDynConfig -> Text -> m (ACE t)
+aceWidgetStatic ac adc initContents = do
+    aceDiv <- fmap fst $ elAttr' (T.pack "div") (addThemeAttr adc) $ text initContents
+    aceInstance <- startACE (_element_raw aceDiv) ac
+    onChange <- setupValueListener aceInstance
+    hasFocus <- setupFocusListener aceInstance
+    updatesDyn <- holdDyn initContents onChange
+    focusDyn <- holdDyn False hasFocus
+
+    let ace = ACE (constDyn $ pure aceInstance) updatesDyn focusDyn
+    setThemeACE (_aceDynConfigTheme adc) aceInstance
     return ace
   where
     static = _aceConfigElemAttrs ac
